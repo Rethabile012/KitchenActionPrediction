@@ -27,8 +27,7 @@ class EpicDataset(Dataset):
         self.data = pd.read_csv(csv_file)
         self.data = self.data[self.data['participant_id'] == participant]
 
-        allowed_videos = [f'P01_{i:03d}' for i in range(101, 105)]
-        self.data = self.data[self.data['video_id'].isin(allowed_videos)]
+        
 
         # Keep only samples whose folders exist
         existing_folders = {f for f in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, f))}
