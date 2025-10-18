@@ -35,7 +35,7 @@ class EpicDataset(Dataset):
         self.data = self.data[self.data['video_id'].isin(existing_folders)]
         self.data.reset_index(drop=True, inplace=True)
 
-        self.data = self.data.head(500)
+        
         self.root_dir = root_dir
         self.transform = transform
         self.seq_len = seq_len
