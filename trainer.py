@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 
 CSV_PATH = '/kaggle/input/kitchen/Dataset/EPIC_100_train.csv'
-FRAME_ROOT = '/kaggle/input/kitchen/Dataset/frames'  # folder with P01_101, P01_102, etc.
+FRAME_ROOT = '/kaggle/working/frames'  # folder with P01_101, P01_102, etc.
 SAVE_MODEL_PATH = 'best_lstm_action_model.pth'
 LOSS_LOG_PATH = 'training_loss.csv'
 
