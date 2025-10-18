@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 
 CSV_PATH = '/kaggle/input/kitchen/Dataset/EPIC_100_train.csv'
-FRAME_ROOT = '/kaggle/working/frames'  # folder with P01_101, P01_102, etc.
+FRAME_ROOT = '/kaggle/working/frames'
 SAVE_MODEL_PATH = 'best_lstm_action_model.pth'
 LOSS_LOG_PATH = 'training_loss.csv'
 
@@ -35,11 +35,9 @@ class EpicDataset(Dataset):
         self.data = self.data[self.data['video_id'].isin(existing_folders)]
         self.data.reset_index(drop=True, inplace=True)
 
-        
         self.root_dir = root_dir
         self.transform = transform
         self.seq_len = seq_len
-        self.data.reset_index(drop=True, inplace=True)
 
         print(f"Loaded {len(self.data)} samples for participant {participant}")
 
@@ -73,11 +71,10 @@ class EpicDataset(Dataset):
         if len(frames) == 0:
             frames = [torch.zeros(3, IMG_SIZE, IMG_SIZE)] * self.seq_len
 
-        # Pad if needed
         while len(frames) < self.seq_len:
             frames.append(frames[-1])
 
-        frames = torch.stack(frames)  # [T, 3, H, W]
+        frames = torch.stack(frames)
         return frames, verb_class, noun_class
 
 
@@ -85,30 +82,43 @@ class EpicDataset(Dataset):
 class VerbNounLSTM(nn.Module):
     def __init__(self, feature_dim=2048, hidden_dim=512, num_verbs=97, num_nouns=300):
         super(VerbNounLSTM, self).__init__()
-
-        # CNN feature extractor (ResNet50)
         resnet = models.resnet50(pretrained=True)
-        self.cnn = nn.Sequential(*list(resnet.children())[:-1])  # remove FC layer
-
+        self.cnn = nn.Sequential(*list(resnet.children())[:-1])
         for param in self.cnn.parameters():
-            param.requires_grad = False  # freeze CNN at first
+            param.requires_grad = False
 
         self.lstm = nn.LSTM(feature_dim, hidden_dim, num_layers=2, batch_first=True)
         self.fc_verb = nn.Linear(hidden_dim, num_verbs)
         self.fc_noun = nn.Linear(hidden_dim, num_nouns)
 
     def forward(self, x):
-        # x: [B, T, 3, 224, 224]
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
-        features = self.cnn(x).view(B, T, -1)  # [B, T, 2048]
-
+        features = self.cnn(x).view(B, T, -1)
         _, (h_n, _) = self.lstm(features)
-        h = h_n[-1]  # last layer’s hidden state
-
+        h = h_n[-1]
         verb_logits = self.fc_verb(h)
         noun_logits = self.fc_noun(h)
         return verb_logits, noun_logits
+
+
+
+def compute_metrics(verb_preds, noun_preds, verb_labels, noun_labels):
+    """Computes Top-1, Top-5, and Action Pair Accuracy."""
+    with torch.no_grad():
+        # Top-1 accuracy
+        verb_top1 = (verb_preds.argmax(dim=1) == verb_labels).float().mean().item()
+        noun_top1 = (noun_preds.argmax(dim=1) == noun_labels).float().mean().item()
+
+        # Top-5 accuracy
+        verb_top5 = (verb_labels.view(-1, 1) == verb_preds.topk(5, dim=1).indices).any(dim=1).float().mean().item()
+        noun_top5 = (noun_labels.view(-1, 1) == noun_preds.topk(5, dim=1).indices).any(dim=1).float().mean().item()
+
+        # Action pair accuracy (both correct)
+        correct_action = ((verb_preds.argmax(dim=1) == verb_labels) &
+                          (noun_preds.argmax(dim=1) == noun_labels)).float().mean().item()
+
+    return verb_top1, noun_top1, verb_top5, noun_top5, correct_action
 
 
 
@@ -120,7 +130,6 @@ def train_model():
                              std=[0.229, 0.224, 0.225])
     ])
 
-    # Dataset split
     full_dataset = EpicDataset(CSV_PATH, FRAME_ROOT, transform)
     val_split = 0.1
     val_size = int(len(full_dataset) * val_split)
@@ -144,50 +153,68 @@ def train_model():
 
         for frames, verb_labels, noun_labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
             frames, verb_labels, noun_labels = frames.to(device), verb_labels.to(device), noun_labels.to(device)
-
             optimizer.zero_grad()
             verb_preds, noun_preds = model(frames)
-            loss_verb = criterion(verb_preds, verb_labels)
-            loss_noun = criterion(noun_preds, noun_labels)
-            loss = loss_verb + loss_noun
+            loss = criterion(verb_preds, verb_labels) + criterion(noun_preds, noun_labels)
             loss.backward()
             optimizer.step()
-
             total_train_loss += loss.item()
 
         avg_train_loss = total_train_loss / len(train_loader)
 
-        # Validation
+        # Validation phase
         model.eval()
         total_val_loss = 0.0
+        metrics = {'verb_top1': 0, 'noun_top1': 0, 'verb_top5': 0, 'noun_top5': 0, 'action_pair': 0}
+        count = 0
+
         with torch.no_grad():
             for frames, verb_labels, noun_labels in val_loader:
                 frames, verb_labels, noun_labels = frames.to(device), verb_labels.to(device), noun_labels.to(device)
                 verb_preds, noun_preds = model(frames)
-                loss_verb = criterion(verb_preds, verb_labels)
-                loss_noun = criterion(noun_preds, noun_labels)
-                loss = loss_verb + loss_noun
+                loss = criterion(verb_preds, verb_labels) + criterion(noun_preds, noun_labels)
                 total_val_loss += loss.item()
 
-        avg_val_loss = total_val_loss / len(val_loader)
-        print(f"Epoch [{epoch+1}/{EPOCHS}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+                v1, n1, v5, n5, a = compute_metrics(verb_preds, noun_preds, verb_labels, noun_labels)
+                metrics['verb_top1'] += v1
+                metrics['noun_top1'] += n1
+                metrics['verb_top5'] += v5
+                metrics['noun_top5'] += n5
+                metrics['action_pair'] += a
+                count += 1
 
-        # Save only best model
+        # Average validation metrics
+        for k in metrics:
+            metrics[k] /= count
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        print(f"\nEpoch [{epoch+1}/{EPOCHS}] - Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        print(f"Verb Top1: {metrics['verb_top1']:.4f} | Noun Top1: {metrics['noun_top1']:.4f}")
+        print(f"Verb Top5: {metrics['verb_top5']:.4f} | Noun Top5: {metrics['noun_top5']:.4f}")
+        print(f"Action Pair Accuracy: {metrics['action_pair']:.4f}")
+
+        # Save best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), SAVE_MODEL_PATH)
-            print(f"New best model saved at epoch {epoch+1} (Val Loss: {avg_val_loss:.4f})")
+            print(f"New best model saved (Val Loss: {avg_val_loss:.4f})")
 
-        # Log loss values
+        # Log metrics for CSV
         loss_log.append({
             'epoch': epoch + 1,
             'train_loss': avg_train_loss,
-            'val_loss': avg_val_loss
+            'val_loss': avg_val_loss,
+            'verb_top1': metrics['verb_top1'],
+            'noun_top1': metrics['noun_top1'],
+            'verb_top5': metrics['verb_top5'],
+            'noun_top5': metrics['noun_top5'],
+            'action_pair': metrics['action_pair']
         })
 
-    # Save training history
+    # Save history
     pd.DataFrame(loss_log).to_csv(LOSS_LOG_PATH, index=False)
     print(f"Training complete. Best model saved to {SAVE_MODEL_PATH}")
+
 
 
 if __name__ == "__main__":
