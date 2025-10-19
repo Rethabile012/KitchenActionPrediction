@@ -197,7 +197,7 @@ def train_model():
         avg_val_loss = total_val_loss / len(val_loader)
         scheduler.step()
 
-        print(f"\n📘 Epoch [{epoch+1}/{EPOCHS}] - Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        print(f"\n Epoch [{epoch+1}/{EPOCHS}] - Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         print(f"Verb Top1: {metrics['verb_top1']:.4f} | Noun Top1: {metrics['noun_top1']:.4f}")
         print(f"Verb Top5: {metrics['verb_top5']:.4f} | Noun Top5: {metrics['noun_top5']:.4f}")
         print(f"Action Pair Accuracy: {metrics['action_pair']:.4f}")
