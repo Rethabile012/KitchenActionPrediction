@@ -16,7 +16,7 @@ LOSS_LOG_PATH = 'training_loss.csv'
 
 BATCH_SIZE = 8
 EPOCHS = 20
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4  
 SEQUENCE_LENGTH = 16
 IMG_SIZE = 224
 
@@ -27,9 +27,7 @@ class EpicDataset(Dataset):
         self.data = pd.read_csv(csv_file)
         self.data = self.data[self.data['participant_id'] == participant]
 
-        
-
-        # Keep only samples whose folders exist
+        # Only keep rows with valid video folders
         existing_folders = {f for f in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, f))}
         self.data = self.data[self.data['video_id'].isin(existing_folders)]
         self.data.reset_index(drop=True, inplace=True)
@@ -53,20 +51,26 @@ class EpicDataset(Dataset):
 
         folder = os.path.join(self.root_dir, video_id)
         frame_ids = list(range(start_frame, stop_frame))
+
         if len(frame_ids) == 0:
             frame_ids = [start_frame]
-        sampled_frames = frame_ids[::max(1, len(frame_ids)//self.seq_len)][:self.seq_len]
 
+        sampled_frames = frame_ids[::max(1, len(frame_ids)//self.seq_len)][:self.seq_len]
         frames = []
+
         for fid in sampled_frames:
             frame_path = os.path.join(folder, f'frame_{fid:010d}.jpg')
             if not os.path.exists(frame_path):
                 continue
-            img = Image.open(frame_path).convert("RGB")
+            try:
+                img = Image.open(frame_path).convert("RGB")
+            except Exception:
+                continue
             if self.transform:
                 img = self.transform(img)
             frames.append(img)
 
+        # Handle missing or empty frames
         if len(frames) == 0:
             frames = [torch.zeros(3, IMG_SIZE, IMG_SIZE)] * self.seq_len
 
@@ -81,10 +85,12 @@ class EpicDataset(Dataset):
 class VerbNounLSTM(nn.Module):
     def __init__(self, feature_dim=2048, hidden_dim=512, num_verbs=97, num_nouns=300):
         super(VerbNounLSTM, self).__init__()
-        resnet = models.resnet50(pretrained=True)
-        self.cnn = nn.Sequential(*list(resnet.children())[:-1])
-        for param in self.cnn.parameters():
-            param.requires_grad = False
+        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        self.cnn = nn.Sequential(*list(resnet.children())[:-1])  # remove FC layer
+
+        # Freeze all except the last layer block (layer4)
+        for name, param in self.cnn.named_parameters():
+            param.requires_grad = ("layer4" in name)
 
         self.lstm = nn.LSTM(feature_dim, hidden_dim, num_layers=2, batch_first=True)
         self.fc_verb = nn.Linear(hidden_dim, num_verbs)
@@ -105,15 +111,12 @@ class VerbNounLSTM(nn.Module):
 def compute_metrics(verb_preds, noun_preds, verb_labels, noun_labels):
     """Computes Top-1, Top-5, and Action Pair Accuracy."""
     with torch.no_grad():
-        # Top-1 accuracy
         verb_top1 = (verb_preds.argmax(dim=1) == verb_labels).float().mean().item()
         noun_top1 = (noun_preds.argmax(dim=1) == noun_labels).float().mean().item()
 
-        # Top-5 accuracy
         verb_top5 = (verb_labels.view(-1, 1) == verb_preds.topk(5, dim=1).indices).any(dim=1).float().mean().item()
         noun_top5 = (noun_labels.view(-1, 1) == noun_preds.topk(5, dim=1).indices).any(dim=1).float().mean().item()
 
-        # Action pair accuracy (both correct)
         correct_action = ((verb_preds.argmax(dim=1) == verb_labels) &
                           (noun_preds.argmax(dim=1) == noun_labels)).float().mean().item()
 
@@ -124,12 +127,17 @@ def compute_metrics(verb_preds, noun_preds, verb_labels, noun_labels):
 def train_model():
     transform = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
     ])
 
     full_dataset = EpicDataset(CSV_PATH, FRAME_ROOT, transform)
+    if len(full_dataset) == 0:
+        raise ValueError("No valid samples found! Check that frames and CSV video_ids match.")
+
     val_split = 0.1
     val_size = int(len(full_dataset) * val_split)
     train_size = len(full_dataset) - val_size
@@ -142,6 +150,7 @@ def train_model():
     model = VerbNounLSTM().to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
     best_val_loss = float('inf')
     loss_log = []
@@ -161,7 +170,7 @@ def train_model():
 
         avg_train_loss = total_train_loss / len(train_loader)
 
-        # Validation phase
+        # Validation
         model.eval()
         total_val_loss = 0.0
         metrics = {'verb_top1': 0, 'noun_top1': 0, 'verb_top5': 0, 'noun_top5': 0, 'action_pair': 0}
@@ -182,38 +191,31 @@ def train_model():
                 metrics['action_pair'] += a
                 count += 1
 
-        # Average validation metrics
         for k in metrics:
             metrics[k] /= count
 
         avg_val_loss = total_val_loss / len(val_loader)
-        print(f"\nEpoch [{epoch+1}/{EPOCHS}] - Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        scheduler.step()
+
+        print(f"\n📘 Epoch [{epoch+1}/{EPOCHS}] - Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         print(f"Verb Top1: {metrics['verb_top1']:.4f} | Noun Top1: {metrics['noun_top1']:.4f}")
         print(f"Verb Top5: {metrics['verb_top5']:.4f} | Noun Top5: {metrics['noun_top5']:.4f}")
         print(f"Action Pair Accuracy: {metrics['action_pair']:.4f}")
 
-        # Save best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), SAVE_MODEL_PATH)
             print(f"New best model saved (Val Loss: {avg_val_loss:.4f})")
 
-        # Log metrics for CSV
         loss_log.append({
             'epoch': epoch + 1,
             'train_loss': avg_train_loss,
             'val_loss': avg_val_loss,
-            'verb_top1': metrics['verb_top1'],
-            'noun_top1': metrics['noun_top1'],
-            'verb_top5': metrics['verb_top5'],
-            'noun_top5': metrics['noun_top5'],
-            'action_pair': metrics['action_pair']
+            **metrics
         })
 
-    # Save history
     pd.DataFrame(loss_log).to_csv(LOSS_LOG_PATH, index=False)
     print(f"Training complete. Best model saved to {SAVE_MODEL_PATH}")
-
 
 
 if __name__ == "__main__":
